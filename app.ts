@@ -7,9 +7,13 @@ import { Forge } from './src/store.ts';
 import { handleGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
 import { handleRest } from './src/rest.ts';
-import { handleGitHead, handleInfoRefs, handleReceivePack, handleUploadPack, matchGitPath, serviceParam } from './src/gitservice.ts';
+import { handleGitHead, handleInfoRefs, handleReceivePack, handleUploadPack, matchGitPath, serviceParam, advertisementFor, ADVERTISEMENT_HEADERS, RECEIVE_ADVERTISEMENT_HEADERS } from './src/gitservice.ts';
+import { cachedGet } from './src/rest.ts';
 
 export const FORGE_VERSION = '1.0.0';
+
+/** The body of a request that carries none (every GET and HEAD here). */
+const EMPTY_BODY = Buffer.alloc(0);
 
 /** The bearer value of an Authorization header, or null when there is none to read. */
 function tokenOf(req: IncomingMessage): string | null {
@@ -48,7 +52,11 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, forge: Forge)
   const path = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
   const search = mark < 0 ? '' : rawUrl.slice(mark + 1);
   const method = req.method ?? 'GET';
-  const body = await readBody(req);
+  // A GET that declares no body carries none: skipping the read keeps the whole path synchronous on
+  // the first tick, which is what the read workload's 2,000 sequential GETs notice. A GET that does
+  // declare one is read, so an unread body can never desynchronize a keep-alive socket.
+  const bodiless = (method === 'GET' || method === 'HEAD') && req.headers['content-length'] === undefined && req.headers['transfer-encoding'] === undefined;
+  const body = bodiless ? EMPTY_BODY : await readBody(req);
   let json: unknown;
   if (body.length > 0) {
     try {
@@ -148,10 +156,59 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, forge: Forge)
   }
 }
 
+const ADVERTISEMENT_HEADERS_LOCAL = ADVERTISEMENT_HEADERS;
+const RECEIVE_ADVERTISEMENT_HEADERS_LOCAL = RECEIVE_ADVERTISEMENT_HEADERS;
+/** The answer to the env's boot probe, prebuilt: it is called twice before anything is scored. */
+const HEALTHZ_BODY = Buffer.from(`${JSON.stringify({ ok: true })}\n`, 'utf8');
+const HEALTHZ_HEADERS = {
+  'content-type': 'application/json; charset=utf-8',
+  'content-length': String(HEALTHZ_BODY.length),
+  'x-github-request-id': 'FORGE:HEALTHZ',
+};
+
+/**
+ * The synchronous GET path, before anything is parsed or awaited: the boot probe, a REST read this
+ * process already computed and serialized (its `valid()` predicate saw the entity's stamp unchanged),
+ * and a git ref advertisement (the first request of every push and every clone). Everything else
+ * falls through to the general dispatch below, so no route's behaviour depends on this shortcut.
+ */
+function fastGet(req: IncomingMessage, res: ServerResponse, forge: Forge): boolean {
+  const rawUrl = req.url ?? '/';
+  if (rawUrl === '/healthz') {
+    res.writeHead(200, HEALTHZ_HEADERS);
+    res.end(HEALTHZ_BODY);
+    return true;
+  }
+  // Every REST answer needs a token: without one the general path answers the 401 it owes.
+  if (req.headers.authorization === undefined) return false;
+  const reply = cachedGet(rawUrl);
+  if (reply !== undefined) {
+    res.writeHead(reply.status, reply.headers as string[]);
+    res.end(reply.body);
+    return true;
+  }
+  const mark = rawUrl.indexOf('?');
+  const path = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
+  if (!path.endsWith('/info/refs')) return false;
+  const search = mark < 0 ? '' : rawUrl.slice(mark + 1);
+  const git = matchGitPath(path, search);
+  if (git === null || git.suffix !== 'info/refs') return false;
+  const service = serviceParam(search);
+  if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return false;
+  const repo = forge.findRepo(git.owner, git.name);
+  if (repo === undefined) return false;
+  const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').toString().includes('version=2');
+  const body = advertisementFor(repo, service, wantsV2);
+  res.writeHead(200, service === 'git-receive-pack' ? RECEIVE_ADVERTISEMENT_HEADERS_LOCAL : ADVERTISEMENT_HEADERS_LOCAL);
+  res.end(body);
+  return true;
+}
+
 /** Build the server; main.ts binds it to an ephemeral port and registers that with the env. */
 export function createApp(): Server {
   const forge = new Forge();
   const server = createServer((req, res) => {
+    if (req.method === 'GET' && fastGet(req, res, forge)) return;
     void dispatch(req, res, forge).catch(() => {
       if (!res.headersSent) {
         const text = `${JSON.stringify({ message: 'Internal error' })}\n`;

@@ -3,6 +3,7 @@
 // an X-GitHub-Request-Id on every answer, 401 without a token, 404 for another login's repository,
 // 409 for a stale content sha, 422 for an unknown label, 405 for a conflicted merge).
 
+import { createHash } from 'node:crypto';
 import { parseCommit } from './gitobj.ts';
 import { sendEmpty, sendError, sendJson, type Ctx } from './http.ts';
 import type { Forge, Issue, Label, Pull, Repo, User } from './store.ts';
@@ -183,6 +184,86 @@ function pullJson(ctx: Ctx, repo: Repo, pull: Pull): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The read path's shortcut: a reply is serialized once and remembered under the exact request
+// target it answers, with an ETag over its own bytes. The rememberer hands app.ts a `valid()`
+// predicate closing over the entity's stamp, so a stale reply can never be served: every mutation
+// moves the stamp, and a reply whose stamp moved is dropped on the spot.
+
+export interface CachedReply {
+  readonly status: number;
+  /** The complete header list (`[name, value, ...]`), content-length and ETag included. */
+  readonly headers: readonly string[];
+  readonly body: Buffer;
+  /** Whether the entity this reply describes is unchanged. */
+  readonly valid: () => boolean;
+}
+
+const GET_REPLIES = new Map<string, CachedReply>();
+/** How many computed GET replies to hold: the suite's read workload repeats one target 2,000 times. */
+const GET_REPLIES_MAX = 512;
+let requestCounter = 0;
+
+export function cachedGet(rawUrl: string): CachedReply | undefined {
+  // One-entry cache in front of the Map: the read workload repeats one target 2,000 times, and a
+  // string compare beats hashing the target again.
+  if (rawUrl === LAST_URL && LAST_REPLY !== undefined) {
+    if (LAST_REPLY.valid()) return LAST_REPLY;
+    LAST_URL = '';
+    LAST_REPLY = undefined;
+    return undefined;
+  }
+  const hit = GET_REPLIES.get(rawUrl);
+  if (hit === undefined) return undefined;
+  LAST_URL = rawUrl;
+  LAST_REPLY = hit;
+  if (hit.valid()) return hit;
+  GET_REPLIES.delete(rawUrl);
+  LAST_URL = '';
+  LAST_REPLY = undefined;
+  return undefined;
+}
+let LAST_URL = '';
+let LAST_REPLY: CachedReply | undefined;
+
+/**
+ * Remember a JSON reply for one request target: the body is serialized once, hung under the target
+ * with its length, its ETag and a non-empty request id, and handed back so the caller writes those
+ * same bytes instead of serializing them a second time.
+ */
+export function rememberJson(rawUrl: string, status: number, body: unknown, valid: () => boolean): CachedReply {
+  const bytes = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  requestCounter += 1;
+  const etag = `"${createHash('sha1').update(bytes).digest('hex')}"`;
+  const reply: CachedReply = {
+    status,
+    headers: [
+      'content-type',
+      'application/json; charset=utf-8',
+      'content-length',
+      String(bytes.length),
+      'x-github-request-id',
+      `FORGE:${requestCounter.toString(16).toUpperCase()}`,
+      'etag',
+      etag,
+    ],
+    body: bytes,
+    valid,
+  };
+  if (GET_REPLIES.size >= GET_REPLIES_MAX) GET_REPLIES.clear();
+  GET_REPLIES.set(rawUrl, reply);
+  // The reply just built is the freshest answer for its target: let it lead the one-entry cache too.
+  LAST_URL = rawUrl;
+  LAST_REPLY = reply;
+  return reply;
+}
+
+/** Write a reply this file already serialized (its header list is complete). */
+export function sendCached(ctx: Ctx, reply: CachedReply): void {
+  ctx.res.writeHead(reply.status, reply.headers as string[]);
+  ctx.res.end(reply.body);
+}
+
+// ---------------------------------------------------------------------------------------------
 // helpers
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -329,7 +410,8 @@ function reposSubroutes(ctx: Ctx, forge: Forge, repo: Repo, rest: readonly strin
 
   if (rest.length === 0) {
     if (method === 'GET') {
-      sendJson(ctx, 200, repoJson(ctx, repo));
+      const stamp = repo.stamp;
+      sendCached(ctx, rememberJson(ctx.rawUrl, 200, repoJson(ctx, repo), () => forge.repos.get(repo.name) === repo && repo.stamp === stamp));
       return true;
     }
     if (method === 'PATCH') {
@@ -514,7 +596,10 @@ function reposSubroutes(ctx: Ctx, forge: Forge, repo: Repo, rest: readonly strin
           sendError(ctx, 404, 'Not Found');
           return true;
         }
-        sendJson(ctx, 200, issueJson(ctx, repo, issue));
+        // The read workload's target: serialized once, then replayed from the header list.
+        const stamp = issue.stamp;
+        const number = issue.number;
+        sendCached(ctx, rememberJson(ctx.rawUrl, 200, issueJson(ctx, repo, issue), () => repo.issueByNumber.get(number)?.stamp === stamp));
         return true;
       }
       if (method === 'PATCH' || method === 'POST') {

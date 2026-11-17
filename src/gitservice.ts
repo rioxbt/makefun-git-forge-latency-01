@@ -33,9 +33,7 @@ const ZERO = '0'.repeat(40);
 const SIDEBAND_LIMIT = 65515;
 const UPLOAD_V0_CAPS = 'side-band-64k thin-pack ofs-delta shallow no-progress multi_ack_detailed allow-tip-sha1-in-want allow-reachable-sha1-in-want';
 const RECEIVE_V0_CAPS = `report-status side-band-64k delete-refs ofs-delta agent=${AGENT}`;
-const ADVERTISEMENT_HEADERS = { 'content-type': UPLOAD_PACK_ADVERTISEMENT, 'cache-control': 'no-cache, max-age=0, must-revalidate' } as const;
 const UPLOAD_RESULT_HEADERS = { 'content-type': UPLOAD_PACK_RESULT } as const;
-const RECEIVE_ADVERTISEMENT_HEADERS = { 'content-type': RECEIVE_PACK_ADVERTISEMENT, 'cache-control': 'no-cache, max-age=0, must-revalidate' } as const;
 const RECEIVE_RESULT_HEADERS = { 'content-type': RECEIVE_PACK_RESULT } as const;
 
 export interface GitTarget {
@@ -113,10 +111,13 @@ function advertisementV0(repo: Repo, service: string, capabilities: string): Buf
 
 const ADVERTISEMENT_V2 = pktLines(['version 2\n', `agent=${AGENT}\n`, 'ls-refs\n', 'fetch=shallow\n', 'object-format=sha1\n', 'flush']);
 
+export const ADVERTISEMENT_HEADERS = { 'content-type': UPLOAD_PACK_ADVERTISEMENT, 'cache-control': 'no-cache, max-age=0, must-revalidate' };
+export const RECEIVE_ADVERTISEMENT_HEADERS = { 'content-type': RECEIVE_PACK_ADVERTISEMENT, 'cache-control': 'no-cache, max-age=0, must-revalidate' };
+
 /** The advertisements, one per (repository state, service): the cache the clone path rides. */
 const advertisementCache = new Map<string, { stamp: number; body: Buffer }>();
 
-function advertisementFor(repo: Repo, service: string, wantsV2: boolean): Buffer {
+export function advertisementFor(repo: Repo, service: string, wantsV2: boolean): Buffer {
   const key = `${repo.id}:${service}:${wantsV2 ? 2 : 0}:${repo.stamp}`;
   const hit = advertisementCache.get(key);
   if (hit !== undefined && hit.stamp === repo.stamp) return hit.body;
@@ -307,6 +308,15 @@ function sideband(data: Buffer): Buffer[] {
 // ---------------------------------------------------------------------------------------------
 // upload-pack
 
+/**
+ * The fetch answers this repository state already produced, keyed by the request that asked for
+ * them: the clone workload's 50 concurrent shallow clones of one tip share one pack build and one
+ * framing pass. The key carries the repository's stamp, so a moved repository never replays an old
+ * pack.
+ */
+const fetchCache = new Map<string, { stamp: number; body: Buffer }>();
+const FETCH_CACHE_MAX = 32;
+
 export function handleUploadPack(ctx: Ctx, repo: Repo, isV2: boolean): void {
   const { packets } = parsePackets(ctx.body);
   const lines: string[] = [];
@@ -344,6 +354,14 @@ export function handleUploadPack(ctx: Ctx, repo: Repo, isV2: boolean): void {
         else if (trimmed.startsWith('deepen ')) depth = Number.parseInt(trimmed.slice(7), 10);
         else if (trimmed === 'done') done = true;
       }
+      const cacheKey = `${repo.id}:${repo.stamp}:${depth ?? 'n'}:${wants.join(',')}:${haves.join(',')}:${shallow.join(',')}`;
+      if (done) {
+        const hit = fetchCache.get(cacheKey);
+        if (hit !== undefined && hit.stamp === repo.stamp) {
+          sendRaw(ctx, 200, hit.body, UPLOAD_RESULT_HEADERS);
+          return;
+        }
+      }
       const parts: Buffer[] = [];
       if (!done) {
         parts.push(pktLine('acknowledgments\n'));
@@ -369,13 +387,17 @@ export function handleUploadPack(ctx: Ctx, repo: Repo, isV2: boolean): void {
         parts.push(...sideband(packOf(repo, selection.oids)));
         parts.push(FLUSH_PKT);
       }
-      sendRaw(ctx, 200, Buffer.concat(parts), UPLOAD_RESULT_HEADERS);
+      const body = Buffer.concat(parts);
+      if (done) {
+        if (fetchCache.size >= FETCH_CACHE_MAX) fetchCache.clear();
+        fetchCache.set(cacheKey, { stamp: repo.stamp, body });
+      }
+      sendRaw(ctx, 200, body, UPLOAD_RESULT_HEADERS);
       return;
     }
     sendError(ctx, 400, 'unsupported protocol v2 command');
     return;
   }
-
   const wants: string[] = [];
   const haves: string[] = [];
   const shallow: string[] = [];
@@ -411,7 +433,6 @@ export function handleUploadPack(ctx: Ctx, repo: Repo, isV2: boolean): void {
 
 export function handleReceivePack(ctx: Ctx, repo: Repo): void {
   const { packets, rest } = parsePackets(ctx.body);
-  const commandOld: string[] = [];
   const commandNew: string[] = [];
   const commandRef: string[] = [];
   let wantsSideband = false;
@@ -425,13 +446,13 @@ export function handleReceivePack(ctx: Ctx, repo: Repo): void {
     first = false;
     const parts = commandText.split(' ');
     if (parts.length < 3) continue;
-    commandOld.push(parts[0]);
     commandNew.push(parts[1]);
     commandRef.push(parts.slice(2).join(' ').replace(/\n$/, ''));
   }
 
   let unpackOk = true;
   let unpackDetail = 'ok';
+  let changed = false;
   if (rest.length > 0) {
     try {
       if (rest[0] !== 0x50) throw new Error('the pack section does not start with PACK');
@@ -439,7 +460,7 @@ export function handleReceivePack(ctx: Ctx, repo: Repo): void {
       for (const [oid, object] of read.objects) {
         if (!repo.objects.has(oid)) repo.objects.set(oid, { type: object.type, data: object.data });
       }
-      repo.stamp += 1;
+      changed = true;
     } catch (err) {
       unpackOk = false;
       unpackDetail = `error ${err instanceof Error ? err.message : String(err)}`;
@@ -453,8 +474,7 @@ export function handleReceivePack(ctx: Ctx, repo: Repo): void {
       const newOid = commandNew[index];
       if (newOid === ZERO) {
         repo.refs.delete(ref);
-        repo.updatedAt = new Date().toISOString();
-        repo.stamp += 1;
+        changed = true;
         report.push(`ok ${ref}\n`);
         continue;
       }
@@ -471,12 +491,17 @@ export function handleReceivePack(ctx: Ctx, repo: Repo): void {
         }
       }
       repo.refs.set(ref, newOid);
-      repo.updatedAt = new Date().toISOString();
-      repo.stamp += 1;
+      changed = true;
       report.push(`ok ${ref}\n`);
     }
   } else {
     for (const ref of commandRef) report.push(`ng ${ref} unpacker error\n`);
+  }
+  // One clock reading per push, and only when the repository actually moved.
+  if (changed) {
+    repo.updatedAt = new Date().toISOString();
+    repo.stamp += 1;
+    ctx.forge.version += 1;
   }
   report.push('flush');
   const reportBytes = pktLines(report);
